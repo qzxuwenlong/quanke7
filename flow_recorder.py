@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import threading
 import time
@@ -47,12 +48,14 @@ class BarAgg:
         self.o = self.h = self.l = self.c = None
         self.vol = self.buy = self.sell = 0.0
         self.n = 0
+        self.levels = {}        # price-bin -> [buy_vol, sell_vol]  (footprint)
 
     def _start(self, bucket: int, px: float):
         self.bucket = bucket
         self.o = self.h = self.l = self.c = px
         self.vol = self.buy = self.sell = 0.0
         self.n = 0
+        self.levels = {}
 
     def add(self, ts: int, px: float, sz: float, side: str):
         """Return a finalized bar dict if this trade rolled the bucket, else None."""
@@ -75,6 +78,11 @@ class BarAgg:
             self.buy += sz
         else:
             self.sell += sz
+        # footprint: bin price to ~4 significant figures (auto-scales any price)
+        step = 10.0 ** (math.floor(math.log10(px)) - 3) if px > 0 else 1.0
+        binp = round(round(px / step) * step, 12)
+        lvl = self.levels.setdefault(binp, [0.0, 0.0])
+        lvl[0 if side == "buy" else 1] += sz
         return finalized
 
     def _finalize(self) -> dict:
@@ -83,7 +91,7 @@ class BarAgg:
         return {"timestamp": self.bucket, "open": self.o, "high": self.h,
                 "low": self.l, "close": self.c, "volume": self.vol,
                 "buy_vol": self.buy, "sell_vol": self.sell, "delta": delta,
-                "cvd": self.cvd, "trades": self.n}
+                "cvd": self.cvd, "trades": self.n, "_levels": self.levels}
 
 
 class Recorder:
@@ -93,6 +101,7 @@ class Recorder:
         self.outdir = outdir
         os.makedirs(outdir, exist_ok=True)
         self.files = {}
+        self.fp_files = {}      # footprint sidecars (JSONL: {"ts":.., "levels":{..}})
         self.aggs = {}
         for inst in insts:
             path = os.path.join(outdir, f"{inst}_{bar_sec}s.csv")
@@ -100,6 +109,8 @@ class Recorder:
             self.files[inst] = open(path, "a", buffering=1)  # line-buffered
             if new:
                 self.files[inst].write(",".join(COLS) + "\n")
+            self.fp_files[inst] = open(
+                os.path.join(outdir, f"{inst}_{bar_sec}s_fp.jsonl"), "a", buffering=1)
             self.aggs[inst] = BarAgg(self.bar_ms, cvd0)
         self.bars_written = 0
 
@@ -124,11 +135,15 @@ class Recorder:
             return
         row = agg.add(int(tr["ts"]), float(tr["px"]), float(tr["sz"]), tr["side"])
         if row is not None:
+            levels = row.pop("_levels", {})
             self.files[inst].write(",".join(str(row[c]) for c in COLS) + "\n")
+            fp = {f"{k:g}": [round(v[0], 6), round(v[1], 6)] for k, v in levels.items()}
+            self.fp_files[inst].write(
+                json.dumps({"ts": row["timestamp"], "levels": fp}) + "\n")
             self.bars_written += 1
 
     def close(self):
-        for f in self.files.values():
+        for f in list(self.files.values()) + list(self.fp_files.values()):
             f.close()
 
 
